@@ -15,6 +15,8 @@ COPY --from=build /app/target/*.jar app.jar
 
 ENV DISCORD_TOKEN=""
 ENV DISCORD_GUILD_ID=""
+ENV DISCORD_MCP_STATE_FILE="/workspace/.discord_mcp_state.properties"
+ENV DISCORD_LAST_MESSAGE_ID=""
 
 EXPOSE 8085
 

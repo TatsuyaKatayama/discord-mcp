@@ -34,6 +34,7 @@ Discord by managing channels, sending messages, and retrieving server informatio
 export DISCORD_TOKEN="YOUR_DISCORD_BOT_TOKEN"
 export DISCORD_GUILD_ID="OPTIONAL_DEFAULT_SERVER_ID"
 export SPRING_PROFILES_ACTIVE=http
+export DISCORD_MCP_STATE_FILE="/workspace/.discord_mcp_state.properties"
 ```
 
 > [!IMPORTANT]
@@ -329,6 +330,8 @@ Remote MCP Connector:
 - [`edit_message`](): Edit a message from a specific channel
 - [`delete_message`](): Delete a message from a specific channel
 - [`read_messages`](): Read message history from a specific channel (includes attachment metadata, supports `count` 1-100 and optional cursor: `before` or `after` or `around`)
+- [`read_new_messages`](): Read only messages newer than the persisted checkpoint and update the checkpoint state file
+- [`set_message_checkpoint`](): Persist the last checked Discord message ID for a channel or checkpoint key
 - [`add_reaction`](): Add a reaction (emoji) to a specific message
 - [`remove_reaction`](): Remove a specified reaction (emoji) from a message
 

@@ -13,14 +13,25 @@ import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Properties;
 
 @Service
 public class MessageService {
 
     private final JDA jda;
+
+    @Value("${DISCORD_MCP_STATE_FILE:/workspace/.discord_mcp_state.properties}")
+    private String checkpointStateFile;
+
+    @Value("${DISCORD_LAST_MESSAGE_ID:}")
+    private String initialLastMessageId;
 
     public MessageService(JDA jda) {
         this.jda = jda;
@@ -241,6 +252,89 @@ public class MessageService {
         return "**Retrieved " + messages.size() + " messages:** \n" + String.join("\n", formatedMessages);
     }
 
+    /**
+     * Reads only messages newer than the persisted checkpoint for a Discord channel.
+     * The checkpoint is stored in DISCORD_MCP_STATE_FILE and updated to the latest seen
+     * message ID after each call. DISCORD_LAST_MESSAGE_ID is used as the initial
+     * checkpoint when no state file entry exists.
+     *
+     * @param channelId          The ID of the channel from which to read messages.
+     * @param count              Optional number of messages to retrieve (default is 100, max is 100).
+     * @param checkpointKey      Optional state key. Defaults to the channel ID.
+     * @param includeBotMessages Optional boolean string. Defaults to false, excluding this bot's own messages from the returned output.
+     * @return A formatted string containing only new non-bot messages and checkpoint details.
+     */
+    @Tool(name = "read_new_messages", description = "Read only messages newer than the persisted checkpoint and update the checkpoint state file.")
+    public String readNewMessages(@ToolParam(description = "Discord channel ID") String channelId,
+                                  @ToolParam(description = "Number of messages to retrieve (1-100)", required = false) String count,
+                                  @ToolParam(description = "Optional checkpoint key. Defaults to channelId", required = false) String checkpointKey,
+                                  @ToolParam(description = "Whether to include this bot's own messages. Defaults to false", required = false) String includeBotMessages) {
+        if (channelId == null || channelId.isEmpty()) {
+            throw new IllegalArgumentException("channelId cannot be null");
+        }
+        int limit = parseMessageLimit(count);
+
+        MessageChannel channel = getMessageChannelById(channelId);
+        if (channel == null) {
+            throw new IllegalArgumentException("Channel not found by channelId");
+        }
+
+        String stateKey = isProvided(checkpointKey) ? checkpointKey : channelId;
+        String previousCheckpoint = loadMessageCheckpoint(stateKey);
+        List<Message> seenMessages;
+        if (isProvided(previousCheckpoint)) {
+            seenMessages = channel.getHistoryAfter(previousCheckpoint, limit).complete().getRetrievedHistory();
+        } else {
+            seenMessages = channel.getHistory().retrievePast(limit).complete();
+        }
+
+        List<Message> inboundMessages = seenMessages.stream()
+                .filter(message -> !isOwnBotMessage(message))
+                .toList();
+        String nextCheckpoint = newestMessageId(previousCheckpoint, inboundMessages);
+        if (isProvided(nextCheckpoint) && !nextCheckpoint.equals(previousCheckpoint)) {
+            saveMessageCheckpoint(stateKey, nextCheckpoint);
+        }
+
+        boolean includeOwnBotMessages = Boolean.parseBoolean(includeBotMessages);
+        List<Message> returnedMessages = seenMessages.stream()
+                .filter(message -> includeOwnBotMessages || !isOwnBotMessage(message))
+                .sorted(Comparator.comparing(Message::getId, MessageService::compareSnowflake))
+                .toList();
+
+        List<String> formattedMessages = formatMessages(returnedMessages);
+        return "**Retrieved " + returnedMessages.size() + " new messages:**"
+                + "\nPrevious checkpoint: " + printableCheckpoint(previousCheckpoint)
+                + "\nCurrent checkpoint: " + printableCheckpoint(nextCheckpoint)
+                + "\nCheckpoint source: newest inbound non-bot message"
+                + "\nState file: " + checkpointStateFile
+                + "\n" + String.join("\n", formattedMessages);
+    }
+
+    /**
+     * Manually sets the persisted message checkpoint for a channel or checkpoint key.
+     *
+     * @param channelId     The Discord channel ID. Used as the default checkpoint key.
+     * @param messageId     The message ID to persist as the last checked checkpoint.
+     * @param checkpointKey Optional state key. Defaults to channelId.
+     * @return A confirmation message.
+     */
+    @Tool(name = "set_message_checkpoint", description = "Persist the last checked Discord message ID for a channel or checkpoint key.")
+    public String setMessageCheckpoint(@ToolParam(description = "Discord channel ID") String channelId,
+                                       @ToolParam(description = "Discord message ID to store as last checked") String messageId,
+                                       @ToolParam(description = "Optional checkpoint key. Defaults to channelId", required = false) String checkpointKey) {
+        if (channelId == null || channelId.isEmpty()) {
+            throw new IllegalArgumentException("channelId cannot be null");
+        }
+        if (messageId == null || messageId.isBlank()) {
+            throw new IllegalArgumentException("messageId cannot be null");
+        }
+
+        String stateKey = isProvided(checkpointKey) ? checkpointKey : channelId;
+        saveMessageCheckpoint(stateKey, messageId);
+        return "Message checkpoint saved. Key: " + stateKey + ", message ID: " + messageId + ", state file: " + checkpointStateFile;
+    }
+
     private int parseMessageLimit(String count) {
         if (count == null || count.isBlank()) {
             return 100;
@@ -280,6 +374,81 @@ public class MessageService {
 
     private boolean isProvided(String value) {
         return value != null && !value.isBlank();
+    }
+
+    private boolean isOwnBotMessage(Message message) {
+        return message.getAuthor() != null
+                && jda.getSelfUser() != null
+                && message.getAuthor().getId().equals(jda.getSelfUser().getId());
+    }
+
+    private String newestMessageId(String currentCheckpoint, List<Message> messages) {
+        String newest = currentCheckpoint;
+        for (Message message : messages) {
+            if (!isProvided(newest) || compareSnowflake(message.getId(), newest) > 0) {
+                newest = message.getId();
+            }
+        }
+        return newest;
+    }
+
+    private synchronized String loadMessageCheckpoint(String key) {
+        Properties properties = loadCheckpointProperties();
+        String saved = properties.getProperty(checkpointPropertyName(key));
+        if (isProvided(saved)) {
+            return saved;
+        }
+        return isProvided(initialLastMessageId) ? initialLastMessageId : "";
+    }
+
+    private synchronized void saveMessageCheckpoint(String key, String messageId) {
+        Properties properties = loadCheckpointProperties();
+        properties.setProperty(checkpointPropertyName(key), messageId);
+        Path path = Path.of(checkpointStateFile);
+        try {
+            Path parent = path.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            try (OutputStream output = Files.newOutputStream(path)) {
+                properties.store(output, "discord-mcp message checkpoints");
+            }
+        } catch (IOException ex) {
+            throw new IllegalStateException("Failed to save message checkpoint state file: " + checkpointStateFile, ex);
+        }
+    }
+
+    private Properties loadCheckpointProperties() {
+        Properties properties = new Properties();
+        Path path = Path.of(checkpointStateFile);
+        if (!Files.isRegularFile(path)) {
+            return properties;
+        }
+        try (InputStream input = Files.newInputStream(path)) {
+            properties.load(input);
+            return properties;
+        } catch (IOException ex) {
+            throw new IllegalStateException("Failed to load message checkpoint state file: " + checkpointStateFile, ex);
+        }
+    }
+
+    private String checkpointPropertyName(String key) {
+        return "message." + key + ".lastMessageId";
+    }
+
+    private String printableCheckpoint(String checkpoint) {
+        return isProvided(checkpoint) ? checkpoint : "(none)";
+    }
+
+    private static int compareSnowflake(String left, String right) {
+        if (left.equals(right)) {
+            return 0;
+        }
+        try {
+            return Long.compareUnsigned(Long.parseUnsignedLong(left), Long.parseUnsignedLong(right));
+        } catch (NumberFormatException ex) {
+            return left.compareTo(right);
+        }
     }
 
     private Path validateReadableFile(String filePath) {
