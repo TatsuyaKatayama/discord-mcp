@@ -7,11 +7,14 @@ import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
 import net.dv8tion.jda.api.entities.channel.concrete.ThreadChannel;
 import net.dv8tion.jda.api.entities.channel.middleman.MessageChannel;
 import net.dv8tion.jda.api.entities.emoji.Emoji;
+import net.dv8tion.jda.api.utils.FileUpload;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 
 @Service
@@ -68,6 +71,71 @@ public class MessageService {
         }
         Message sentMessage = channel.sendMessage(message).complete();
         return "Message sent successfully. Message link: " + sentMessage.getJumpUrl();
+    }
+
+    /**
+     * Sends a local file to a specified Discord channel.
+     *
+     * @param channelId The ID of the channel where the file will be sent.
+     * @param filePath  The local file path inside the discord-mcp container.
+     * @param message   Optional message content to send with the file.
+     * @return A confirmation message with a link to the sent message.
+     */
+    @Tool(name = "send_file", description = "Send a local file to a specific channel. The file path must be readable inside the discord-mcp container.")
+    public String sendFile(@ToolParam(description = "Discord channel ID") String channelId,
+                           @ToolParam(description = "Local file path inside the discord-mcp container") String filePath,
+                           @ToolParam(description = "Optional message content", required = false) String message) {
+        if (channelId == null || channelId.isEmpty()) {
+            throw new IllegalArgumentException("channelId cannot be null");
+        }
+
+        MessageChannel channel = getMessageChannelById(channelId);
+        if (channel == null) {
+            throw new IllegalArgumentException("Channel not found by channelId");
+        }
+
+        Path path = validateReadableFile(filePath);
+        Message sentMessage = channel.sendMessage(safeMessage(message))
+                .addFiles(FileUpload.fromData(path))
+                .complete();
+        return "File sent successfully. Message link: " + sentMessage.getJumpUrl();
+    }
+
+    /**
+     * Replies to a specific Discord message with a local file.
+     *
+     * @param channelId The ID of the channel containing the message.
+     * @param messageId The ID of the message to reply to.
+     * @param filePath  The local file path inside the discord-mcp container.
+     * @param message   Optional message content to send with the file.
+     * @return A confirmation message with a link to the sent reply.
+     */
+    @Tool(name = "reply_file", description = "Reply to a specific message with a local file. The file path must be readable inside the discord-mcp container.")
+    public String replyFile(@ToolParam(description = "Discord channel ID") String channelId,
+                            @ToolParam(description = "Discord message ID to reply to") String messageId,
+                            @ToolParam(description = "Local file path inside the discord-mcp container") String filePath,
+                            @ToolParam(description = "Optional message content", required = false) String message) {
+        if (channelId == null || channelId.isEmpty()) {
+            throw new IllegalArgumentException("channelId cannot be null");
+        }
+        if (messageId == null || messageId.isEmpty()) {
+            throw new IllegalArgumentException("messageId cannot be null");
+        }
+
+        MessageChannel channel = getMessageChannelById(channelId);
+        if (channel == null) {
+            throw new IllegalArgumentException("Channel not found by channelId");
+        }
+        Message messageById = channel.retrieveMessageById(messageId).complete();
+        if (messageById == null) {
+            throw new IllegalArgumentException("Message not found by messageId");
+        }
+
+        Path path = validateReadableFile(filePath);
+        Message sentMessage = messageById.reply(safeMessage(message))
+                .addFiles(FileUpload.fromData(path))
+                .complete();
+        return "File reply sent successfully. Message link: " + sentMessage.getJumpUrl();
     }
 
     /**
@@ -212,6 +280,24 @@ public class MessageService {
 
     private boolean isProvided(String value) {
         return value != null && !value.isBlank();
+    }
+
+    private Path validateReadableFile(String filePath) {
+        if (filePath == null || filePath.isBlank()) {
+            throw new IllegalArgumentException("filePath cannot be null");
+        }
+        Path path = Path.of(filePath);
+        if (!Files.isRegularFile(path)) {
+            throw new IllegalArgumentException("File not found by filePath");
+        }
+        if (!Files.isReadable(path)) {
+            throw new IllegalArgumentException("File is not readable");
+        }
+        return path;
+    }
+
+    private String safeMessage(String message) {
+        return message == null || message.isBlank() ? " " : message;
     }
 
     /**
